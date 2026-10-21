@@ -421,3 +421,252 @@ pub fn object_value(object: &MediaObject, field: &str) -> Option<Value> {
         metadata_field => object.metadata.get(metadata_field).cloned(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    fn object(
+        id: u64,
+        media_type: MediaType,
+        metadata: BTreeMap<String, Value>,
+        embedding: Vec<f32>,
+    ) -> MediaObject {
+        MediaObject {
+            object_id: id,
+            media_type,
+            physical_location: format!("data/{id}.media"),
+            size: id * 10,
+            timestamp: format!("2026-01-{id:02}T00:00:00Z"),
+            metadata,
+            embedding,
+        }
+    }
+
+    fn catalog() -> Catalog {
+        Catalog {
+            objects: vec![
+                object(
+                    1,
+                    MediaType::Image,
+                    BTreeMap::from([
+                        ("camera".to_owned(), json!("drone")),
+                        ("duration_seconds".to_owned(), json!(12.5)),
+                    ]),
+                    vec![1.0, 0.0, 0.0],
+                ),
+                object(
+                    2,
+                    MediaType::Image,
+                    BTreeMap::from([
+                        ("camera".to_owned(), json!("drone")),
+                        ("duration_seconds".to_owned(), json!(30.0)),
+                    ]),
+                    vec![0.8, 0.2, 0.0],
+                ),
+                object(
+                    3,
+                    MediaType::Audio,
+                    BTreeMap::from([("speaker".to_owned(), json!("field"))]),
+                    vec![0.0, 1.0],
+                ),
+            ],
+            next_id: 4,
+            ..Catalog::default()
+        }
+    }
+
+    #[test]
+    fn value_hash_index_resolves_bucket_collisions() {
+        let mut keys_by_slot = HashMap::<usize, String>::new();
+        let (first, second) = (0..1000)
+            .map(|number| number.to_string())
+            .find_map(|key| {
+                let slot = hash_key(&key) as usize % 32;
+                keys_by_slot
+                    .insert(slot, key.clone())
+                    .map(|first| (first, key))
+            })
+            .expect("find two keys with a matching bucket");
+        let mut index = ValueHashIndex::new();
+        index.insert(first.clone(), 7);
+        index.insert(second.clone(), 11);
+
+        assert_eq!(index.get(&first), Some(&[7][..]));
+        assert_eq!(index.get(&second), Some(&[11][..]));
+        assert_eq!(index.get("not present"), None);
+    }
+
+    #[test]
+    fn value_hash_index_appends_duplicate_positions_and_grows() {
+        let mut index = ValueHashIndex::new();
+        index.insert("same".to_owned(), 1);
+        index.insert("same".to_owned(), 4);
+        for value in 0..100 {
+            index.insert(format!("distinct-{value}"), value + 10);
+        }
+
+        assert_eq!(index.get("same"), Some(&[1, 4][..]));
+        for value in 0..100 {
+            assert_eq!(
+                index.get(&format!("distinct-{value}")),
+                Some(&[value + 10][..])
+            );
+        }
+        assert!(index.buckets.len() > 32);
+    }
+
+    #[test]
+    fn metadata_index_matches_values_and_synthesizes_catalog_fields() {
+        let catalog = catalog();
+        let index = MetadataIndex::build(&catalog);
+
+        assert_eq!(index.equality("camera", &json!("drone")), Some(&[0, 1][..]));
+        assert_eq!(
+            index.equality("duration", &json!(12.5)),
+            Some(&[0][..])
+        );
+        assert_eq!(index.equality("duration_seconds", &json!(30.0)), Some(&[1][..]));
+        assert_eq!(index.equality("object_id", &json!(2)), Some(&[1][..]));
+        assert_eq!(index.equality("id", &json!(3)), Some(&[2][..]));
+        assert_eq!(
+            index.equality("media_type", &json!("audio")),
+            Some(&[2][..])
+        );
+        assert_eq!(
+            index.equality("physical_location", &json!("data/1.media")),
+            Some(&[0][..])
+        );
+        assert_eq!(index.equality("size", &json!(20)), Some(&[1][..]));
+        assert_eq!(
+            index.equality("timestamp", &json!("2026-01-03T00:00:00Z")),
+            Some(&[2][..])
+        );
+        assert_eq!(index.equality("camera", &json!("missing")), None);
+        assert_eq!(index.equality("missing", &json!("value")), None);
+    }
+
+    #[test]
+    fn metadata_index_preserves_explicit_duration_alias_and_counts_entries() {
+        let catalog = Catalog {
+            objects: vec![object(
+                5,
+                MediaType::Audio,
+                BTreeMap::from([
+                    ("duration".to_owned(), json!(99)),
+                    ("duration_seconds".to_owned(), json!(12)),
+                ]),
+                vec![0.1],
+            )],
+            ..Catalog::default()
+        };
+        let index = MetadataIndex::build(&catalog);
+
+        assert_eq!(index.equality("duration", &json!(99)), Some(&[0][..]));
+        assert_eq!(index.equality("duration", &json!(12)), None);
+        assert_eq!(index.entry_count(), 8);
+        assert!(index.size_estimate_bytes() > 0);
+    }
+
+    #[test]
+    fn empty_metadata_index_has_no_entries_or_estimated_storage() {
+        let index = MetadataIndex::build(&Catalog::default());
+
+        assert_eq!(index.entry_count(), 0);
+        assert_eq!(index.size_estimate_bytes(), 0);
+    }
+
+    #[test]
+    fn lsh_index_tracks_modalities_and_returns_matching_dimension_candidates() {
+        let catalog = catalog();
+        let index = LshIndex::build(&catalog);
+
+        assert_eq!(index.vector_count(), 3);
+        assert_eq!(index.vector_count_for(MediaType::Image), 2);
+        assert_eq!(index.vector_count_for(MediaType::Audio), 1);
+        assert!(index.bucket_count() > 0);
+        assert!(index.size_estimate_bytes() > 0);
+        let image_candidates = index.candidate_positions(&[1.0, 0.0, 0.0], MediaType::Image, 1);
+        assert!(image_candidates.contains(&0));
+        assert!(image_candidates.iter().all(|position| *position < 2));
+        assert_eq!(
+            index.candidate_positions(&[0.0, 1.0], MediaType::Audio, 1),
+            vec![2]
+        );
+        assert!(index
+            .candidate_positions(&[1.0], MediaType::Image, 1)
+            .is_empty());
+    }
+
+    #[test]
+    fn lsh_index_ignores_zero_and_mismatched_dimensions() {
+        let catalog = Catalog {
+            objects: vec![
+                object(2, MediaType::Image, BTreeMap::new(), vec![1.0, 0.0]),
+                object(1, MediaType::Image, BTreeMap::new(), Vec::new()),
+                object(3, MediaType::Image, BTreeMap::new(), vec![1.0]),
+            ],
+            ..Catalog::default()
+        };
+        let index = LshIndex::build(&catalog);
+
+        assert_eq!(index.vector_count_for(MediaType::Image), 3);
+        assert!(index.bucket_count() > 0);
+        assert_eq!(
+            index.candidate_positions(&[1.0, 0.0], MediaType::Image, 10),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn lsh_index_without_a_modality_returns_no_candidates() {
+        let index = LshIndex::build(&Catalog::default());
+
+        assert_eq!(index.vector_count(), 0);
+        assert_eq!(index.bucket_count(), 0);
+        assert!(index
+            .candidate_positions(&[1.0], MediaType::Audio, 1)
+            .is_empty());
+    }
+
+    #[test]
+    fn cosine_similarity_handles_aligned_orthogonal_and_invalid_vectors() {
+        assert!((cosine_similarity(&[1.0, 2.0], &[1.0, 2.0]) - 1.0).abs() < f32::EPSILON);
+        assert!(cosine_similarity(&[1.0, 0.0], &[0.0, 1.0]).abs() < f32::EPSILON);
+        assert!((cosine_similarity(&[1.0, 0.0], &[-1.0, 0.0]) + 1.0).abs() < f32::EPSILON);
+        assert_eq!(cosine_similarity(&[], &[]), 0.0);
+        assert_eq!(cosine_similarity(&[1.0], &[1.0, 0.0]), 0.0);
+        assert_eq!(cosine_similarity(&[0.0, 0.0], &[1.0, 0.0]), 0.0);
+    }
+
+    #[test]
+    fn object_value_reads_builtins_case_insensitively_and_duration_alias() {
+        let object = object(
+            7,
+            MediaType::Audio,
+            BTreeMap::from([
+                ("duration_seconds".to_owned(), json!(8.5)),
+                ("speaker".to_owned(), json!("field")),
+            ]),
+            vec![0.5],
+        );
+
+        assert_eq!(object_value(&object, "ID"), Some(json!(7)));
+        assert_eq!(object_value(&object, "OBJECT_ID"), Some(json!(7)));
+        assert_eq!(object_value(&object, "Media_Type"), Some(json!("audio")));
+        assert_eq!(
+            object_value(&object, "PHYSICAL_LOCATION"),
+            Some(json!("data/7.media"))
+        );
+        assert_eq!(object_value(&object, "size"), Some(json!(70)));
+        assert_eq!(
+            object_value(&object, "timestamp"),
+            Some(json!("2026-01-07T00:00:00Z"))
+        );
+        assert_eq!(object_value(&object, "duration"), Some(json!(8.5)));
+        assert_eq!(object_value(&object, "SPEAKER"), Some(json!("field")));
+        assert_eq!(object_value(&object, "missing"), None);
+    }
+}

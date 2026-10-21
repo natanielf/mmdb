@@ -539,3 +539,253 @@ fn print_usage() {
          Supported media inputs are images and audio; video is rejected."
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::media::MediaType;
+    use serde_json::json;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let id = NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("mmdb-main-tests-{}-{id}", std::process::id()));
+            fs::create_dir(&path).expect("create unique temporary test directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn object(
+        object_id: u64,
+        media_type: MediaType,
+        metadata: BTreeMap<String, Value>,
+        embedding: Vec<f32>,
+    ) -> MediaObject {
+        MediaObject {
+            object_id,
+            media_type,
+            physical_location: format!("data/objects/{object_id:08}.bin"),
+            size: 16,
+            timestamp: "2026-01-01T00:00:00Z".to_owned(),
+            metadata,
+            embedding,
+        }
+    }
+
+    fn sample_catalog() -> Catalog {
+        Catalog {
+            objects: vec![
+                object(
+                    1,
+                    MediaType::Image,
+                    BTreeMap::from([
+                        ("camera".to_owned(), json!("drone")),
+                        ("rating".to_owned(), json!(4)),
+                    ]),
+                    vec![1.0, 0.0],
+                ),
+                object(
+                    2,
+                    MediaType::Audio,
+                    BTreeMap::from([("speaker".to_owned(), json!("field"))]),
+                    vec![0.0, 1.0],
+                ),
+            ],
+            next_id: 3,
+            ..Catalog::default()
+        }
+    }
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn parse_metadata_accepts_empty_input() {
+        assert!(parse_metadata(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_metadata_normalizes_keys_and_parses_json_scalars() {
+        let metadata = parse_metadata(&args(&[
+            " Camera =drone",
+            "rating=4",
+            "verified=true",
+            "missing=null",
+            "label=a=b",
+        ]))
+        .unwrap();
+
+        assert_eq!(metadata["camera"], json!("drone"));
+        assert_eq!(metadata["rating"], json!(4));
+        assert_eq!(metadata["verified"], json!(true));
+        assert_eq!(metadata["missing"], Value::Null);
+        assert_eq!(metadata["label"], json!("a=b"));
+    }
+
+    #[test]
+    fn parse_metadata_keeps_non_json_values_as_strings() {
+        let metadata = parse_metadata(&args(&["name=not JSON", "empty="])).unwrap();
+
+        assert_eq!(metadata["name"], json!("not JSON"));
+        assert_eq!(metadata["empty"], json!(""));
+    }
+
+    #[test]
+    fn parse_metadata_rejects_arguments_without_equals() {
+        let error = parse_metadata(&args(&["camera"])).unwrap_err();
+        assert!(error.contains("key=value"));
+    }
+
+    #[test]
+    fn parse_metadata_rejects_empty_or_invalid_keys() {
+        assert!(parse_metadata(&args(&["  =value"]))
+            .unwrap_err()
+            .contains("cannot be empty"));
+        assert!(parse_metadata(&args(&["camera-name=value"]))
+            .unwrap_err()
+            .contains("only letters, digits, or underscores"));
+    }
+
+    #[test]
+    fn parse_metadata_rejects_reserved_keys_case_insensitively() {
+        let error = parse_metadata(&args(&["Object_ID=1"])).unwrap_err();
+        assert!(error.contains("reserved catalog field"));
+    }
+
+    #[test]
+    fn parse_metadata_rejects_duplicate_keys_after_normalization() {
+        let error = parse_metadata(&args(&["Camera=drone", "camera=air"])).unwrap_err();
+        assert!(error.contains("supplied more than once"));
+    }
+
+    #[test]
+    fn parse_metadata_rejects_array_and_object_values() {
+        assert!(parse_metadata(&args(&["tags=[1,2]"]))
+            .unwrap_err()
+            .contains("scalar value"));
+        assert!(parse_metadata(&args(&["details={\"x\":1}"]))
+            .unwrap_err()
+            .contains("scalar value"));
+    }
+
+    #[test]
+    fn lookup_by_id_returns_matching_object_and_ignores_missing_ids() {
+        let catalog = sample_catalog();
+        let index = MetadataIndex::build(&catalog);
+
+        assert_eq!(lookup_by_id(&catalog, &index, 1).unwrap().object_id, 1);
+        assert_eq!(lookup_by_id(&catalog, &index, 2).unwrap().object_id, 2);
+        assert!(lookup_by_id(&catalog, &index, 0).is_none());
+        assert!(lookup_by_id(&catalog, &index, u64::MAX).is_none());
+    }
+
+    #[test]
+    fn lookup_by_id_handles_an_empty_catalog() {
+        let catalog = Catalog::default();
+        let index = MetadataIndex::build(&catalog);
+
+        assert!(lookup_by_id(&catalog, &index, 1).is_none());
+    }
+
+    #[test]
+    fn percentile_uses_nearest_rank_and_handles_boundaries() {
+        let values = [40, 10, 30, 20];
+
+        assert_eq!(percentile(&[], 0.5), 0);
+        assert_eq!(percentile(&[7], 0.95), 7);
+        assert_eq!(percentile(&values, 0.0), 10);
+        assert_eq!(percentile(&values, 0.5), 20);
+        assert_eq!(percentile(&values, 0.95), 40);
+        assert_eq!(percentile(&values, 2.0), 40);
+    }
+
+    #[test]
+    fn mean_helpers_handle_empty_and_populated_values() {
+        assert_eq!(mean_usize(&[]), 0.0);
+        assert_eq!(mean_usize(&[1, 2, 6]), 3.0);
+        assert_eq!(mean_f64(&[]), 0.0);
+        assert_eq!(mean_f64(&[0.25, 0.75, 1.0]), 2.0 / 3.0);
+    }
+
+    #[test]
+    fn runtime_open_builds_indexes_from_a_saved_catalog() {
+        let directory = TempDir::new();
+        let store = Store::new(directory.path());
+        store.save(&sample_catalog()).unwrap();
+
+        let runtime = Runtime::open(directory.path().to_path_buf()).unwrap();
+
+        assert_eq!(runtime.catalog.objects.len(), 2);
+        assert_eq!(
+            runtime.metadata_index.equality("camera", &json!("drone")),
+            Some(&[0][..])
+        );
+        assert_eq!(runtime.lsh_index.vector_count(), 2);
+        assert!(lookup_by_id(&runtime.catalog, &runtime.metadata_index, 2).is_some());
+    }
+
+    #[test]
+    fn runtime_open_uses_an_empty_catalog_when_no_catalog_exists() {
+        let directory = TempDir::new();
+
+        let runtime = Runtime::open(directory.path().to_path_buf()).unwrap();
+
+        assert!(runtime.catalog.objects.is_empty());
+        assert_eq!(runtime.metadata_index.entry_count(), 0);
+        assert_eq!(runtime.lsh_index.vector_count(), 0);
+    }
+
+    #[test]
+    fn runtime_open_reports_invalid_catalog_json() {
+        let directory = TempDir::new();
+        let catalog_path = directory.path().join("data").join("catalog.json");
+        fs::create_dir_all(catalog_path.parent().unwrap()).unwrap();
+        fs::write(&catalog_path, b"{not json").unwrap();
+
+        let error = match Runtime::open(directory.path().to_path_buf()) {
+            Ok(_) => panic!("invalid catalog should fail to load"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("invalid catalog"));
+    }
+
+    #[test]
+    fn benchmark_accepts_get_and_metadata_find_queries() {
+        let directory = TempDir::new();
+        let store = Store::new(directory.path());
+        store.save(&sample_catalog()).unwrap();
+        let runtime = Runtime::open(directory.path().to_path_buf()).unwrap();
+        let statements = args(&["GET 1", "FIND IMAGE WHERE camera = 'drone' LIMIT 5"]);
+
+        assert!(benchmark(&runtime, &statements).is_ok());
+    }
+
+    #[test]
+    fn benchmark_returns_query_parse_errors() {
+        let directory = TempDir::new();
+        let runtime = Runtime::open(directory.path().to_path_buf()).unwrap();
+
+        let error = benchmark(&runtime, &args(&["not a query"])).unwrap_err();
+
+        assert!(!error.is_empty());
+    }
+}

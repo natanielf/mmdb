@@ -244,3 +244,222 @@ fn audio_features(samples: &[(u64, f32)], total_frames: u64) -> Vec<f32> {
     }
     features
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let id = NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("mmdb-media-tests-{}-{id}", std::process::id()));
+            fs::create_dir(&path).expect("create unique temporary directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn analysis_error(path: &Path) -> String {
+        match analyze(path) {
+            Ok(_) => panic!("analysis should fail for fixture"),
+            Err(error) => error,
+        }
+    }
+
+    fn write_wav(path: &Path, samples: &[i16], sample_rate: u32) {
+        let data_len = (samples.len() * 2) as u32;
+        let mut file = fs::File::create(path).unwrap();
+        file.write_all(b"RIFF").unwrap();
+        file.write_all(&(36 + data_len).to_le_bytes()).unwrap();
+        file.write_all(b"WAVEfmt ").unwrap();
+        file.write_all(&16_u32.to_le_bytes()).unwrap();
+        file.write_all(&1_u16.to_le_bytes()).unwrap();
+        file.write_all(&1_u16.to_le_bytes()).unwrap();
+        file.write_all(&sample_rate.to_le_bytes()).unwrap();
+        file.write_all(&(sample_rate * 2).to_le_bytes()).unwrap();
+        file.write_all(&2_u16.to_le_bytes()).unwrap();
+        file.write_all(&16_u16.to_le_bytes()).unwrap();
+        file.write_all(b"data").unwrap();
+        file.write_all(&data_len.to_le_bytes()).unwrap();
+        for sample in samples {
+            file.write_all(&sample.to_le_bytes()).unwrap();
+        }
+    }
+
+    #[test]
+    fn media_type_uses_stable_lowercase_names() {
+        assert_eq!(MediaType::Image.as_str(), "image");
+        assert_eq!(MediaType::Audio.as_str(), "audio");
+        assert_eq!(
+            serde_json::to_string(&MediaType::Image).unwrap(),
+            "\"image\""
+        );
+        assert_eq!(
+            serde_json::from_str::<MediaType>("\"audio\"").unwrap(),
+            MediaType::Audio
+        );
+    }
+
+    #[test]
+    fn image_embedding_is_a_normalized_four_histogram_vector() {
+        let mut image = image::RgbImage::new(2, 1);
+        image.put_pixel(0, 0, image::Rgb([0, 64, 255]));
+        image.put_pixel(1, 0, image::Rgb([31, 95, 224]));
+
+        let embedding = image_embedding(&image);
+
+        assert_eq!(embedding.len(), 32);
+        for channel_histogram in embedding.chunks_exact(8) {
+            assert!((channel_histogram.iter().sum::<f32>() - 1.0).abs() < f32::EPSILON);
+        }
+        assert_eq!(embedding[0], 1.0);
+        assert_eq!(embedding[10], 1.0);
+        assert_eq!(embedding[23], 1.0);
+        assert_eq!(embedding[25], 0.5);
+        assert_eq!(embedding[26], 0.5);
+    }
+
+    #[test]
+    fn analyze_reads_image_dimensions_format_and_embedding() {
+        let directory = TempDir::new();
+        let path = directory.path().join("sample.png");
+        let mut image = image::RgbImage::new(3, 2);
+        for pixel in image.pixels_mut() {
+            *pixel = image::Rgb([40, 100, 200]);
+        }
+        image.save(&path).unwrap();
+
+        let analysis = analyze(&path).unwrap();
+
+        assert_eq!(analysis.media_type, MediaType::Image);
+        assert_eq!(analysis.metadata["width"], json!(3));
+        assert_eq!(analysis.metadata["height"], json!(2));
+        assert_eq!(analysis.metadata["channels"], json!(3));
+        assert_eq!(analysis.metadata["format"], json!("png"));
+        assert_eq!(analysis.embedding.len(), 32);
+        assert!(analysis.embedding.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn analyze_reports_corrupt_image_files() {
+        let directory = TempDir::new();
+        let path = directory.path().join("corrupt.png");
+        fs::write(&path, b"not a png").unwrap();
+
+        let error = analysis_error(&path);
+
+        assert!(error.contains("cannot decode image"));
+        assert!(error.contains("corrupt.png"));
+    }
+
+    #[test]
+    fn audio_extension_check_covers_supported_aliases_only() {
+        for extension in [
+            "wav", "wave", "mp3", "flac", "ogg", "opus", "aac", "m4a", "aiff", "aif",
+        ] {
+            assert!(is_audio_extension(extension), "{extension}");
+        }
+        for extension in ["", "WAV", "mp4", "png", "mkv"] {
+            assert!(!is_audio_extension(extension), "{extension}");
+        }
+    }
+
+    #[test]
+    fn analyze_decodes_generated_wav_and_reports_audio_features() {
+        let directory = TempDir::new();
+        let path = directory.path().join("tone.wav");
+        let samples: Vec<i16> = (0..800)
+            .map(|index| {
+                if (index / 2) % 2 == 0 {
+                    16_000
+                } else {
+                    -16_000
+                }
+            })
+            .collect();
+        write_wav(&path, &samples, 8_000);
+
+        let analysis = analyze(&path).unwrap();
+
+        assert_eq!(analysis.media_type, MediaType::Audio);
+        assert_eq!(analysis.metadata["format"], json!("wav"));
+        assert_eq!(analysis.metadata["duration_seconds"], json!(0.1));
+        assert_eq!(analysis.metadata["sample_rate"], json!(8_000));
+        assert_eq!(analysis.metadata["channels"], json!(1));
+        assert_eq!(analysis.embedding.len(), 32);
+        assert!(analysis.embedding.iter().all(|value| value.is_finite()));
+        assert!(analysis.embedding[..16].iter().any(|energy| *energy > 0.0));
+        assert!(analysis.embedding[16..]
+            .iter()
+            .any(|crossing| *crossing > 0.0));
+    }
+
+    #[test]
+    fn analyze_reports_invalid_audio_containers() {
+        let directory = TempDir::new();
+        let path = directory.path().join("corrupt.wav");
+        fs::write(&path, b"not a wav file").unwrap();
+
+        let error = analysis_error(&path);
+
+        assert!(error.contains("cannot inspect audio"));
+    }
+
+    #[test]
+    fn analyze_rejects_unsupported_media_extensions() {
+        let directory = TempDir::new();
+        let path = directory.path().join("movie.mp4");
+        fs::write(&path, b"video").unwrap();
+
+        let error = analysis_error(&path);
+
+        assert!(error.contains("unsupported media file"));
+        assert!(error.contains("Video is not supported"));
+    }
+
+    #[test]
+    fn audio_features_split_energy_and_crossings_into_sixteen_segments() {
+        let samples = vec![(0, -1.0), (1, 1.0), (2, -1.0), (80, 0.5), (81, 0.5)];
+
+        let features = audio_features(&samples, 160);
+
+        assert_eq!(features.len(), 32);
+        assert!((features[0] - 1.0).abs() < f32::EPSILON);
+        assert!((features[8] - 0.5).abs() < f32::EPSILON);
+        assert_eq!(features[1], 0.0);
+        assert_eq!(features[16], 1.0);
+        assert_eq!(features[24], 0.0);
+        assert!(features[1..8].iter().all(|value| *value == 0.0));
+        assert!(features[9..16].iter().all(|value| *value == 0.0));
+        assert!(features[17..].iter().all(|value| *value == 0.0));
+    }
+
+    #[test]
+    fn audio_features_handle_empty_samples_and_zero_total_frames() {
+        let empty = audio_features(&[], 100);
+        let single = audio_features(&[(0, -0.5)], 0);
+
+        assert_eq!(empty, vec![0.0; 32]);
+        assert_eq!(single.len(), 32);
+        assert_eq!(single[0], 0.5);
+        assert!(single[1..].iter().all(|value| *value == 0.0));
+    }
+}

@@ -633,3 +633,650 @@ impl Parser {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::MediaObject;
+    use serde_json::json;
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let id = NEXT_TEMP_DIR.fetch_add(1, AtomicOrdering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("mmdb-query-tests-{}-{id}", std::process::id()));
+            fs::create_dir(&path).expect("create unique temporary directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct Fixture {
+        _directory: TempDir,
+        store: Store,
+        catalog: Catalog,
+        metadata_index: MetadataIndex,
+        lsh_index: LshIndex,
+        query_path: PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let directory = TempDir::new();
+            let query_path = directory.path().join("query.png");
+            let red_path = directory.path().join("red.png");
+            let blue_path = directory.path().join("blue.png");
+            let green_path = directory.path().join("green.png");
+            let red_embedding = write_image(&red_path, [240, 20, 20]);
+            let blue_embedding = write_image(&blue_path, [20, 20, 240]);
+            let green_embedding = write_image(&green_path, [20, 240, 20]);
+            write_image(&query_path, [240, 20, 20]);
+
+            let catalog = Catalog {
+                objects: vec![
+                    MediaObject {
+                        object_id: 20,
+                        media_type: MediaType::Image,
+                        physical_location: "data/objects/red.png".to_owned(),
+                        size: 10,
+                        timestamp: "2026-01-01T00:00:00Z".to_owned(),
+                        metadata: BTreeMap::from([
+                            ("camera".to_owned(), json!("drone")),
+                            ("rating".to_owned(), json!(4)),
+                            ("label".to_owned(), json!("north ridge")),
+                        ]),
+                        embedding: red_embedding,
+                    },
+                    MediaObject {
+                        object_id: 10,
+                        media_type: MediaType::Image,
+                        physical_location: "data/objects/blue.png".to_owned(),
+                        size: 20,
+                        timestamp: "2026-01-02T00:00:00Z".to_owned(),
+                        metadata: BTreeMap::from([
+                            ("camera".to_owned(), json!("tripod")),
+                            ("rating".to_owned(), json!(8)),
+                            ("label".to_owned(), json!("east ridge")),
+                        ]),
+                        embedding: blue_embedding,
+                    },
+                    MediaObject {
+                        object_id: 30,
+                        media_type: MediaType::Image,
+                        physical_location: "data/objects/green.png".to_owned(),
+                        size: 30,
+                        timestamp: "2026-01-03T00:00:00Z".to_owned(),
+                        metadata: BTreeMap::from([
+                            ("camera".to_owned(), json!("drone")),
+                            ("rating".to_owned(), json!(7)),
+                            ("label".to_owned(), json!("south ridge")),
+                        ]),
+                        embedding: green_embedding,
+                    },
+                ],
+                next_id: 31,
+                ..Catalog::default()
+            };
+            let metadata_index = MetadataIndex::build(&catalog);
+            let lsh_index = LshIndex::build(&catalog);
+            let store = Store::new(directory.path().join("database"));
+            Self {
+                _directory: directory,
+                store,
+                catalog,
+                metadata_index,
+                lsh_index,
+                query_path,
+            }
+        }
+    }
+
+    fn write_image(path: &Path, color: [u8; 3]) -> Vec<f32> {
+        let mut image = image::RgbImage::new(4, 4);
+        for pixel in image.pixels_mut() {
+            *pixel = image::Rgb(color);
+        }
+        image.save(path).unwrap();
+        crate::media::analyze(path).unwrap().embedding
+    }
+
+    fn find_query(media_type: Option<MediaType>, predicates: Vec<Predicate>) -> FindQuery {
+        FindQuery {
+            media_type,
+            predicates,
+            similar_to: None,
+            limit: 10,
+        }
+    }
+
+    fn execute_fixture(
+        fixture: &Fixture,
+        query: &FindQuery,
+        plan: Plan,
+    ) -> Result<ExecutionResult, String> {
+        execute(
+            &fixture.catalog,
+            &fixture.metadata_index,
+            &fixture.lsh_index,
+            &fixture.store,
+            query,
+            plan,
+        )
+    }
+
+    #[test]
+    fn plan_parse_accepts_names_aliases_and_case_insensitively() {
+        for (name, plan) in [
+            ("AUTO", Plan::Auto),
+            ("index", Plan::Indexed),
+            ("indexed", Plan::Indexed),
+            ("scan", Plan::Scan),
+            ("full-scan", Plan::Scan),
+            ("exact", Plan::Exact),
+            ("ann", Plan::Ann),
+            ("approx", Plan::Ann),
+            ("filter-first", Plan::FilterFirst),
+            ("vector-first", Plan::VectorFirst),
+        ] {
+            assert_eq!(Plan::parse(name).unwrap(), plan, "{name}");
+        }
+    }
+
+    #[test]
+    fn plan_name_returns_canonical_names() {
+        assert_eq!(Plan::Auto.name(), "auto");
+        assert_eq!(Plan::Indexed.name(), "indexed");
+        assert_eq!(Plan::Scan.name(), "full-scan");
+        assert_eq!(Plan::Exact.name(), "exact");
+        assert_eq!(Plan::Ann.name(), "ann");
+        assert_eq!(Plan::FilterFirst.name(), "filter-first");
+        assert_eq!(Plan::VectorFirst.name(), "vector-first");
+    }
+
+    #[test]
+    fn plan_parse_rejects_unknown_names() {
+        assert!(Plan::parse("random").unwrap_err().contains("unknown plan"));
+    }
+
+    #[test]
+    fn parse_get_accepts_numeric_and_quoted_unsigned_ids() {
+        assert!(matches!(parse("GET 42").unwrap(), Command::Get(42)));
+        assert!(matches!(parse("get '0007'").unwrap(), Command::Get(7)));
+    }
+
+    #[test]
+    fn parse_get_rejects_invalid_or_trailing_values() {
+        for statement in ["GET", "GET -1", "GET 1.5", "GET 1 trailing"] {
+            assert!(parse(statement).is_err(), "{statement}");
+        }
+    }
+
+    #[test]
+    fn parse_find_defaults_and_media_types() {
+        let Command::Find(object_query) = parse("FIND object").unwrap() else {
+            panic!("expected FIND command");
+        };
+        assert_eq!(object_query.media_type, None);
+        assert_eq!(object_query.limit, 10);
+        assert!(object_query.predicates.is_empty());
+
+        let Command::Find(image_query) = parse("find IMAGE").unwrap() else {
+            panic!("expected FIND command");
+        };
+        assert_eq!(image_query.media_type, Some(MediaType::Image));
+
+        let Command::Find(audio_query) = parse("FIND audio").unwrap() else {
+            panic!("expected FIND command");
+        };
+        assert_eq!(audio_query.media_type, Some(MediaType::Audio));
+    }
+
+    #[test]
+    fn parse_find_handles_comparison_contains_between_similarity_and_limit() {
+        let Command::Find(query) = parse(
+            "FIND IMAGE WHERE Camera = 'drone' AND rating >= 4 AND label CONTAINS 'ridge' \
+             AND timestamp BETWEEN '2026-01-01' AND '2026-12-31' \
+             SIMILAR TO 'query image.png' LIMIT 25",
+        )
+        .unwrap() else {
+            panic!("expected FIND command");
+        };
+
+        assert_eq!(query.media_type, Some(MediaType::Image));
+        assert_eq!(query.predicates.len(), 4);
+        assert_eq!(query.predicates[0].field, "camera");
+        assert_eq!(query.predicates[0].operator, Operator::Eq);
+        assert_eq!(query.predicates[0].value, json!("drone"));
+        assert_eq!(query.predicates[1].operator, Operator::Ge);
+        assert_eq!(query.predicates[1].value, json!(4));
+        assert_eq!(query.predicates[2].operator, Operator::Contains);
+        assert_eq!(query.predicates[3].operator, Operator::Between);
+        assert_eq!(
+            query.predicates[3].value,
+            json!(["2026-01-01", "2026-12-31"])
+        );
+        assert_eq!(query.similar_to, Some(PathBuf::from("query image.png")));
+        assert_eq!(query.limit, 25);
+    }
+
+    #[test]
+    fn parse_supports_all_comparison_operators_and_string_limits() {
+        for (operator, expected) in [
+            ("=", Operator::Eq),
+            ("!=", Operator::Ne),
+            ("<", Operator::Lt),
+            ("<=", Operator::Le),
+            (">", Operator::Gt),
+            (">=", Operator::Ge),
+        ] {
+            let statement = format!("FIND OBJECT WHERE value {operator} 3");
+            let Command::Find(query) = parse(&statement).unwrap() else {
+                panic!("expected FIND command");
+            };
+            assert_eq!(query.predicates[0].operator, expected, "{operator}");
+        }
+
+        let Command::Find(query) = parse("FIND OBJECT LIMIT '7'").unwrap() else {
+            panic!("expected FIND command");
+        };
+        assert_eq!(query.limit, 7);
+    }
+
+    #[test]
+    fn parse_unescapes_matching_quotes_and_backslashes() {
+        let Command::Find(query) = parse(r#"FIND IMAGE WHERE note = 'a\'b\\c'"#).unwrap() else {
+            panic!("expected FIND command");
+        };
+        assert_eq!(query.predicates[0].value, json!("a'b\\c"));
+    }
+
+    #[test]
+    fn parse_rejects_invalid_commands_and_media_types() {
+        for statement in ["", "SELECT IMAGE", "FIND", "FIND VIDEO"] {
+            assert!(parse(statement).is_err(), "{statement}");
+        }
+    }
+
+    #[test]
+    fn parse_rejects_missing_or_unsupported_predicate_parts() {
+        for statement in [
+            "FIND IMAGE WHERE",
+            "FIND IMAGE WHERE rating",
+            "FIND IMAGE WHERE rating == 3",
+            "FIND IMAGE WHERE rating =",
+            "FIND IMAGE WHERE rating APPROX 3",
+            "FIND IMAGE WHERE label CONTAINS",
+            "FIND IMAGE WHERE rating BETWEEN 1",
+            "FIND IMAGE WHERE rating BETWEEN 1 OR 3",
+            "FIND IMAGE WHERE rating BETWEEN 1 AND",
+        ] {
+            assert!(parse(statement).is_err(), "{statement}");
+        }
+    }
+
+    #[test]
+    fn parse_rejects_invalid_similarity_clauses_and_limits() {
+        for statement in [
+            "FIND IMAGE SIMILAR",
+            "FIND IMAGE SIMILAR IMAGE",
+            "FIND IMAGE SIMILAR TO",
+            "FIND IMAGE SIMILAR TO 5",
+            "FIND IMAGE LIMIT",
+            "FIND IMAGE LIMIT 0",
+            "FIND IMAGE LIMIT -1",
+            "FIND IMAGE LIMIT 1.5",
+            "FIND IMAGE LIMIT 1 trailing",
+        ] {
+            assert!(parse(statement).is_err(), "{statement}");
+        }
+    }
+
+    #[test]
+    fn parse_rejects_unterminated_strings_and_bare_bang() {
+        assert!(parse("FIND IMAGE WHERE name = 'open")
+            .unwrap_err()
+            .contains("unterminated"));
+        assert!(parse("FIND IMAGE WHERE rating ! 2")
+            .unwrap_err()
+            .contains("expected !="));
+    }
+
+    #[test]
+    fn compare_supports_numeric_text_boolean_and_null_values() {
+        assert_eq!(compare(&json!(1), &json!(2)), Some(Ordering::Less));
+        assert_eq!(compare(&json!(2.5), &json!(2)), Some(Ordering::Greater));
+        assert_eq!(compare(&json!("a"), &json!("b")), Some(Ordering::Less));
+        assert_eq!(compare(&json!(false), &json!(true)), Some(Ordering::Less));
+        assert_eq!(compare(&Value::Null, &Value::Null), Some(Ordering::Equal));
+        assert_eq!(compare(&json!(1), &json!("1")), None);
+        assert_eq!(compare(&json!(false), &json!(0)), None);
+    }
+
+    #[test]
+    fn object_matches_applies_all_predicate_types_and_media_filter() {
+        let fixture = Fixture::new();
+        let object = &fixture.catalog.objects[0];
+        let predicates = vec![
+            Predicate {
+                field: "rating".to_owned(),
+                operator: Operator::Ge,
+                value: json!(4),
+            },
+            Predicate {
+                field: "rating".to_owned(),
+                operator: Operator::Le,
+                value: json!(4),
+            },
+            Predicate {
+                field: "camera".to_owned(),
+                operator: Operator::Ne,
+                value: json!("tripod"),
+            },
+            Predicate {
+                field: "label".to_owned(),
+                operator: Operator::Contains,
+                value: json!("ridge"),
+            },
+            Predicate {
+                field: "rating".to_owned(),
+                operator: Operator::Between,
+                value: json!([4, 5]),
+            },
+        ];
+
+        assert!(object_matches(object, Some(MediaType::Image), &predicates));
+        assert!(!object_matches(object, Some(MediaType::Audio), &predicates));
+        assert!(!object_matches(
+            object,
+            None,
+            &[Predicate {
+                field: "missing".to_owned(),
+                operator: Operator::Ne,
+                value: json!(1),
+            }]
+        ));
+    }
+
+    #[test]
+    fn object_matches_rejects_invalid_contains_and_between_operands() {
+        let fixture = Fixture::new();
+        let object = &fixture.catalog.objects[0];
+
+        for predicate in [
+            Predicate {
+                field: "rating".to_owned(),
+                operator: Operator::Contains,
+                value: json!("4"),
+            },
+            Predicate {
+                field: "rating".to_owned(),
+                operator: Operator::Between,
+                value: json!([4]),
+            },
+            Predicate {
+                field: "rating".to_owned(),
+                operator: Operator::Between,
+                value: json!([5, 6]),
+            },
+        ] {
+            assert!(!object_matches(object, None, &[predicate]));
+        }
+    }
+
+    #[test]
+    fn choose_plan_selects_defaults_and_preserves_explicit_choice() {
+        let metadata_only = find_query(Some(MediaType::Image), Vec::new());
+        let mut similarity = metadata_only.clone();
+        similarity.similar_to = Some(PathBuf::from("query.png"));
+        let mut hybrid = similarity.clone();
+        hybrid.predicates.push(Predicate {
+            field: "camera".to_owned(),
+            operator: Operator::Eq,
+            value: json!("drone"),
+        });
+
+        assert_eq!(choose_plan(Plan::Auto, &metadata_only), Plan::Indexed);
+        assert_eq!(choose_plan(Plan::Auto, &similarity), Plan::Ann);
+        assert_eq!(choose_plan(Plan::Auto, &hybrid), Plan::FilterFirst);
+        assert_eq!(choose_plan(Plan::Scan, &metadata_only), Plan::Scan);
+    }
+
+    #[test]
+    fn resolve_query_path_prefers_existing_path_then_database_relative_path() {
+        let fixture = Fixture::new();
+        let direct = resolve_query_path(&fixture.query_path, &fixture.store).unwrap();
+        assert_eq!(direct, fixture.query_path);
+
+        let relative = PathBuf::from("data/query.png");
+        let database_path = fixture.store.resolve_location("data/query.png");
+        fs::create_dir_all(database_path.parent().unwrap()).unwrap();
+        fs::copy(&fixture.query_path, &database_path).unwrap();
+        assert_eq!(
+            resolve_query_path(&relative, &fixture.store).unwrap(),
+            database_path
+        );
+    }
+
+    #[test]
+    fn resolve_query_path_reports_missing_file() {
+        let fixture = Fixture::new();
+
+        let error = resolve_query_path(&PathBuf::from("missing.png"), &fixture.store).unwrap_err();
+
+        assert!(error.contains("similarity query file not found"));
+    }
+
+    #[test]
+    fn indexed_candidates_narrows_by_media_and_equality_predicates() {
+        let fixture = Fixture::new();
+        let all_drone_images = indexed_candidates(
+            &fixture.catalog,
+            &fixture.metadata_index,
+            Some(MediaType::Image),
+            &[Predicate {
+                field: "camera".to_owned(),
+                operator: Operator::Eq,
+                value: json!("drone"),
+            }],
+        );
+        let all = indexed_candidates(
+            &fixture.catalog,
+            &fixture.metadata_index,
+            None,
+            &[Predicate {
+                field: "rating".to_owned(),
+                operator: Operator::Gt,
+                value: json!(0),
+            }],
+        );
+        let absent = indexed_candidates(
+            &fixture.catalog,
+            &fixture.metadata_index,
+            None,
+            &[Predicate {
+                field: "camera".to_owned(),
+                operator: Operator::Eq,
+                value: json!("absent"),
+            }],
+        );
+
+        assert_eq!(all_drone_images, vec![0, 2]);
+        assert_eq!(all, vec![0, 1, 2]);
+        assert_eq!(absent, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn execute_runs_metadata_queries_with_scan_and_indexed_plans() {
+        let fixture = Fixture::new();
+        let query = find_query(
+            Some(MediaType::Image),
+            vec![
+                Predicate {
+                    field: "camera".to_owned(),
+                    operator: Operator::Eq,
+                    value: json!("drone"),
+                },
+                Predicate {
+                    field: "rating".to_owned(),
+                    operator: Operator::Gt,
+                    value: json!(5),
+                },
+            ],
+        );
+
+        for plan in [Plan::Auto, Plan::Indexed, Plan::Scan] {
+            let result = execute_fixture(&fixture, &query, plan).unwrap();
+            assert_eq!(result.hits.len(), 1, "{plan:?}");
+            assert_eq!(result.hits[0].object.object_id, 30, "{plan:?}");
+            assert_eq!(result.total_matches_before_limit, 1, "{plan:?}");
+            assert_eq!(
+                result.plan,
+                if plan == Plan::Auto {
+                    Plan::Indexed
+                } else {
+                    plan
+                }
+            );
+            assert_eq!(result.hits[0].similarity, None);
+        }
+    }
+
+    #[test]
+    fn execute_sorts_metadata_hits_by_id_and_applies_limit() {
+        let fixture = Fixture::new();
+        let mut query = find_query(None, Vec::new());
+        query.limit = 2;
+
+        let result = execute_fixture(&fixture, &query, Plan::Scan).unwrap();
+
+        assert_eq!(
+            result
+                .hits
+                .iter()
+                .map(|hit| hit.object.object_id)
+                .collect::<Vec<_>>(),
+            vec![10, 20]
+        );
+        assert_eq!(result.total_matches_before_limit, 3);
+        assert_eq!(result.candidates_examined, 3);
+    }
+
+    #[test]
+    fn execute_rejects_similarity_plans_without_similarity_clause() {
+        let fixture = Fixture::new();
+        let query = find_query(None, Vec::new());
+
+        for plan in [Plan::Exact, Plan::Ann, Plan::FilterFirst, Plan::VectorFirst] {
+            assert!(
+                execute_fixture(&fixture, &query, plan)
+                    .unwrap_err()
+                    .contains("requires a SIMILAR TO clause"),
+                "{plan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn execute_similarity_ranks_exact_matches_and_supports_all_plans() {
+        let fixture = Fixture::new();
+        let mut query = find_query(Some(MediaType::Image), Vec::new());
+        query.similar_to = Some(fixture.query_path.clone());
+
+        for plan in [
+            Plan::Auto,
+            Plan::Exact,
+            Plan::Ann,
+            Plan::FilterFirst,
+            Plan::VectorFirst,
+        ] {
+            let result = execute_fixture(&fixture, &query, plan).unwrap();
+            assert!(!result.hits.is_empty(), "{plan:?}");
+            assert_eq!(result.hits[0].object.object_id, 20, "{plan:?}");
+            assert!(result.hits[0].similarity.unwrap() > 0.999, "{plan:?}");
+            assert_eq!(
+                result.plan,
+                if plan == Plan::Auto { Plan::Ann } else { plan }
+            );
+        }
+    }
+
+    #[test]
+    fn execute_similarity_infers_modality_for_object_search() {
+        let fixture = Fixture::new();
+        let mut query = find_query(None, Vec::new());
+        query.similar_to = Some(fixture.query_path.clone());
+
+        let result = execute_fixture(&fixture, &query, Plan::Exact).unwrap();
+
+        assert_eq!(result.hits[0].object.object_id, 20);
+        assert!(result.hits.iter().all(|hit| hit.similarity.is_some()));
+    }
+
+    #[test]
+    fn execute_similarity_respects_hybrid_filter_and_tie_breaking() {
+        let fixture = Fixture::new();
+        let mut query = find_query(
+            Some(MediaType::Image),
+            vec![Predicate {
+                field: "camera".to_owned(),
+                operator: Operator::Eq,
+                value: json!("drone"),
+            }],
+        );
+        query.similar_to = Some(fixture.query_path.clone());
+
+        let exact = execute_fixture(&fixture, &query, Plan::Exact).unwrap();
+        let filter_first = execute_fixture(&fixture, &query, Plan::FilterFirst).unwrap();
+
+        assert_eq!(
+            exact
+                .hits
+                .iter()
+                .map(|hit| hit.object.object_id)
+                .collect::<Vec<_>>(),
+            vec![20, 30]
+        );
+        assert_eq!(
+            filter_first
+                .hits
+                .iter()
+                .map(|hit| hit.object.object_id)
+                .collect::<Vec<_>>(),
+            vec![20, 30]
+        );
+        assert_eq!(filter_first.plan, Plan::FilterFirst);
+    }
+
+    #[test]
+    fn execute_reports_missing_query_path_and_modality_mismatch() {
+        let fixture = Fixture::new();
+        let mut missing = find_query(Some(MediaType::Image), Vec::new());
+        missing.similar_to = Some(PathBuf::from("missing.png"));
+        assert!(execute_fixture(&fixture, &missing, Plan::Exact)
+            .unwrap_err()
+            .contains("similarity query file not found"));
+
+        let mut mismatch = find_query(Some(MediaType::Audio), Vec::new());
+        mismatch.similar_to = Some(fixture.query_path.clone());
+        assert!(execute_fixture(&fixture, &mismatch, Plan::Exact)
+            .unwrap_err()
+            .contains("query file is image, but FIND specifies audio"));
+    }
+}
