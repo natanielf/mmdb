@@ -71,7 +71,7 @@ fn run() -> Result<(), String> {
 
     match command_name.as_str() {
         "init" => {
-            let mut catalog = store.load()?;
+            let catalog = store.load()?;
             store.save(&catalog)?;
             println!("Initialized MMDB at {}", store.root().display());
             println!("Catalog: {}", store.catalog_path().display());
