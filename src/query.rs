@@ -21,6 +21,8 @@ pub enum Operator {
     Le,
     Gt,
     Ge,
+    Contains,
+    Between,
 }
 
 #[derive(Clone, Debug)]
@@ -136,12 +138,37 @@ pub fn parse(input: &str) -> Result<Command, String> {
                     .next_word()
                     .ok_or_else(|| "expected a metadata field after WHERE".to_owned())?
                     .to_ascii_lowercase();
-                let operator = parser
-                    .next_operator()
-                    .ok_or_else(|| "expected =, !=, <, <=, >, or >= after field".to_owned())?;
-                let value = parser
-                    .next_literal()
-                    .ok_or_else(|| "expected a value after comparison operator".to_owned())?;
+                let operator = if let Some(keyword) = parser.next_word_keyword() {
+                    match keyword.to_ascii_uppercase().as_str() {
+                        "CONTAINS" => Operator::Contains,
+                        "BETWEEN" => Operator::Between,
+                        _ => return Err(format!("unsupported operator '{keyword}' after field '{field}'")),
+                    }
+                } else {
+                    parser
+                        .next_operator()
+                        .ok_or_else(|| "expected comparison operator after field".to_owned())?
+                };
+                let value = match operator {
+                    Operator::Contains => parser
+                        .next_literal()
+                        .ok_or_else(|| "CONTAINS requires a quoted or literal value".to_owned())?,
+                    Operator::Between => {
+                        let low = parser
+                            .next_literal()
+                            .ok_or_else(|| "BETWEEN requires a lower bound value".to_owned())?;
+                        if !parser.consume_word("AND") {
+                            return Err("BETWEEN requires an AND between lower and upper bounds".to_owned());
+                        }
+                        let high = parser
+                            .next_literal()
+                            .ok_or_else(|| "BETWEEN requires an upper bound value".to_owned())?;
+                        Value::Array(vec![low, high])
+                    }
+                    _ => parser
+                        .next_literal()
+                        .ok_or_else(|| "expected a value after comparison operator".to_owned())?,
+                };
                 query.predicates.push(Predicate {
                     field,
                     operator,
@@ -403,11 +430,36 @@ fn object_matches(
         let Some(actual) = object_value(object, &predicate.field) else {
             return false;
         };
-        match compare(&actual, &predicate.value) {
-            Some(Ordering::Equal) => predicate.operator == Operator::Eq,
-            Some(Ordering::Less) => matches!(predicate.operator, Operator::Ne | Operator::Lt | Operator::Le),
-            Some(Ordering::Greater) => matches!(predicate.operator, Operator::Ne | Operator::Gt | Operator::Ge),
-            None => false,
+        match predicate.operator {
+            Operator::Eq => compare(&actual, &predicate.value) == Some(Ordering::Equal),
+            Operator::Ne => compare(&actual, &predicate.value) != Some(Ordering::Equal),
+            Operator::Lt => compare(&actual, &predicate.value) == Some(Ordering::Less),
+            Operator::Le => matches!(compare(&actual, &predicate.value), Some(Ordering::Less | Ordering::Equal)),
+            Operator::Gt => compare(&actual, &predicate.value) == Some(Ordering::Greater),
+            Operator::Ge => matches!(compare(&actual, &predicate.value), Some(Ordering::Greater | Ordering::Equal)),
+            Operator::Contains => {
+                let (Some(actual_string), Some(expected)) = (actual.as_str(), predicate.value.as_str()) else {
+                    return false;
+                };
+                actual_string.contains(expected)
+            }
+            Operator::Between => {
+                let Some(bounds) = predicate.value.as_array() else {
+                    return false;
+                };
+                if bounds.len() != 2 {
+                    return false;
+                }
+                let Some(lower) = bounds.first() else {
+                    return false;
+                };
+                let Some(upper) = bounds.get(1) else {
+                    return false;
+                };
+                let lower_ok = matches!(compare(&actual, lower), Some(Ordering::Equal | Ordering::Greater));
+                let upper_ok = matches!(compare(&actual, upper), Some(Ordering::Equal | Ordering::Less));
+                lower_ok && upper_ok
+            }
         }
     })
 }
@@ -527,6 +579,19 @@ impl Parser {
             true
         } else {
             false
+        }
+    }
+
+    fn next_word_keyword(&mut self) -> Option<String> {
+        let value = match self.tokens.get(self.cursor)? {
+            Token::Atom(value) => value.clone(),
+            _ => return None,
+        };
+        if value.eq_ignore_ascii_case("CONTAINS") || value.eq_ignore_ascii_case("BETWEEN") {
+            self.cursor += 1;
+            Some(value)
+        } else {
+            None
         }
     }
 

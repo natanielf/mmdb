@@ -36,12 +36,14 @@ The query parser accepts:
 
 ~~~text
 FIND IMAGE|AUDIO|OBJECT
-[WHERE field (=|!=|<|<=|>|>=) value [AND ...]]
+[WHERE field (=|!=|<|<=|>|>=|CONTAINS|BETWEEN) value [AND ...]]
 [SIMILAR TO 'query-media-path']
 [LIMIT positive-integer]
 
 GET object-id
 ~~~
+
+`CONTAINS` matches substring values in string fields, and `BETWEEN low AND high` evaluates inclusive numeric or timestamp ranges.
 
 OBJECT searches both supported media types. A similarity query must use a query file with the same modality. Query paths may be absolute, relative to the current directory, or relative to the database root.
 
