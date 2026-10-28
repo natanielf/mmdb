@@ -3,6 +3,7 @@ use crate::media::MediaType;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
+#[derive(Default)]
 pub struct MetadataIndex {
     fields: Vec<(String, ValueHashIndex)>,
     entries: usize,
@@ -54,15 +55,6 @@ impl ValueHashIndex {
         for (key, positions) in old_buckets.into_iter().flatten() {
             let slot = hash_key(&key) as usize % new_capacity;
             self.buckets[slot].push((key, positions));
-        }
-    }
-}
-
-impl Default for MetadataIndex {
-    fn default() -> Self {
-        Self {
-            fields: Vec::new(),
-            entries: 0,
         }
     }
 }
@@ -176,9 +168,11 @@ struct ModalityLsh {
 pub struct LshIndex {
     image: Option<ModalityLsh>,
     audio: Option<ModalityLsh>,
+    video: Option<ModalityLsh>,
     vector_count: usize,
     image_count: usize,
     audio_count: usize,
+    video_count: usize,
 }
 
 impl LshIndex {
@@ -202,14 +196,25 @@ impl LshIndex {
                 (object.media_type == MediaType::Audio).then_some(position)
             })
             .collect();
+        let video_positions: Vec<usize> = catalog
+            .objects
+            .iter()
+            .enumerate()
+            .filter_map(|(position, object)| {
+                (object.media_type == MediaType::Video).then_some(position)
+            })
+            .collect();
         let image = build_modality(catalog, &image_positions, 0x1a2b_3c4d_55aa_7721);
         let audio = build_modality(catalog, &audio_positions, 0x7f4a_7c15_9e37_79b9);
+        let video = build_modality(catalog, &video_positions, 0x9b7c_1d44_3b9f_88c2);
         Self {
             image,
             audio,
-            vector_count: image_positions.len() + audio_positions.len(),
+            video,
+            vector_count: image_positions.len() + audio_positions.len() + video_positions.len(),
             image_count: image_positions.len(),
             audio_count: audio_positions.len(),
+            video_count: video_positions.len(),
         }
     }
 
@@ -284,6 +289,7 @@ impl LshIndex {
         match media_type {
             MediaType::Image => self.image_count,
             MediaType::Audio => self.audio_count,
+            MediaType::Video => self.video_count,
         }
     }
 
@@ -291,6 +297,7 @@ impl LshIndex {
         self.image
             .iter()
             .chain(self.audio.iter())
+            .chain(self.video.iter())
             .flat_map(|modality| modality.tables.iter())
             .map(|table| table.buckets.len())
             .sum()
@@ -300,6 +307,7 @@ impl LshIndex {
         self.image
             .iter()
             .chain(self.audio.iter())
+            .chain(self.video.iter())
             .flat_map(|modality| modality.tables.iter())
             .map(|table| {
                 table.projections.iter().map(|p| p.len() * 4).sum::<usize>()
@@ -316,6 +324,7 @@ impl LshIndex {
         match media_type {
             MediaType::Image => self.image.as_ref(),
             MediaType::Audio => self.audio.as_ref(),
+            MediaType::Video => self.video.as_ref(),
         }
     }
 }
@@ -442,6 +451,7 @@ mod tests {
             timestamp: format!("2026-01-{id:02}T00:00:00Z"),
             metadata,
             embedding,
+            segment_embeddings: vec![],
         }
     }
 

@@ -247,6 +247,7 @@ fn print_object(object: &MediaObject, similarity: Option<f32>) {
         println!("cosine_similarity: {score:.6}");
     }
     println!("embedding_dimensions: {}", object.embedding.len());
+    println!("segment_embedding_count: {}", object.segment_embeddings.len());
     println!(
         "metadata: {}",
         serde_json::to_string_pretty(&object.metadata).unwrap_or_else(|_| "{}".to_owned())
@@ -288,7 +289,18 @@ fn print_stats(runtime: &Runtime) {
         .iter()
         .filter(|object| object.media_type == media::MediaType::Image)
         .count();
-    let audio_count = runtime.catalog.objects.len() - image_count;
+    let audio_count = runtime
+        .catalog
+        .objects
+        .iter()
+        .filter(|object| object.media_type == media::MediaType::Audio)
+        .count();
+    let video_count = runtime
+        .catalog
+        .objects
+        .iter()
+        .filter(|object| object.media_type == media::MediaType::Video)
+        .count();
     let vector_count: usize = runtime
         .catalog
         .objects
@@ -316,6 +328,7 @@ fn print_stats(runtime: &Runtime) {
     println!("objects: {}", runtime.catalog.objects.len());
     println!("image objects: {image_count}");
     println!("audio objects: {audio_count}");
+    println!("video objects: {video_count}");
     println!("vector embeddings: {}", runtime.catalog.objects.len());
     println!("embedding values: {vector_count}");
     println!("estimated structured metadata bytes: {metadata_bytes}");
@@ -524,7 +537,7 @@ fn repl(runtime: &mut Runtime, requested_plan: Plan) -> Result<(), String> {
 
 fn print_usage() {
     println!(
-        "MMDB - image and audio database\n\
+        "MMDB - image, audio, and video database\n\
          \n\
          Commands:\n\
            mmdb init [--db DIR]\n\
@@ -536,7 +549,7 @@ fn print_usage() {
            mmdb repl [--plan PLAN] [--db DIR]\n\
          \n\
          Similarity query paths may be absolute, relative to the current directory, or relative to DIR.\n\
-         Supported media inputs are images and audio; video is rejected."
+         Supported media inputs are images, audio, and video."
     );
 }
 
@@ -586,6 +599,7 @@ mod tests {
             timestamp: "2026-01-01T00:00:00Z".to_owned(),
             metadata,
             embedding,
+            segment_embeddings: vec![],
         }
     }
 

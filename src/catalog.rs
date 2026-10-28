@@ -14,6 +14,7 @@ pub struct MediaObject {
     pub timestamp: String,
     pub metadata: BTreeMap<String, Value>,
     pub embedding: Vec<f32>,
+    pub segment_embeddings: Vec<Vec<f32>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -145,6 +146,7 @@ impl Store {
             timestamp,
             metadata,
             embedding: analysis.embedding,
+            segment_embeddings: analysis.segment_embeddings,
         };
         catalog.objects.push(object.clone());
         catalog.next_id = id.saturating_add(1);
@@ -253,6 +255,7 @@ mod tests {
                 timestamp: "2026-01-02T03:04:05Z".to_owned(),
                 metadata: BTreeMap::from([("camera".to_owned(), json!("drone"))]),
                 embedding: vec![0.25, 0.75],
+                segment_embeddings: vec![],
             }],
         };
 
@@ -407,8 +410,8 @@ mod tests {
     #[test]
     fn ingest_rejects_unsupported_media() {
         let directory = TempDir::new();
-        let source = directory.path().join("clip.mp4");
-        fs::write(&source, b"not a supported image or audio file").unwrap();
+        let source = directory.path().join("clip.bin");
+        fs::write(&source, b"not a supported media file").unwrap();
         let store = Store::new(directory.path().join("database"));
         let mut catalog = Catalog::default();
 
