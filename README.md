@@ -85,6 +85,10 @@ cargo run --release -- bench "GET 1" "GET 2" "FIND IMAGE WHERE camera = 'drone' 
 
 stats reports the object, embedding, payload, catalog, and estimated in-memory index sizes, plus index build times.
 
+## Integration tests
+
+Run the CLI integration suite with `cargo test --test cli_workflows`. Tests generate small synthetic PNG and WAV fixtures, plus deterministic arbitrary bytes with an `.mp4` extension for the current byte-based video path (not a playable video). Each test uses and removes its own temporary database; no checked-in media is used.
+
 ## Design and limits
 
 See [DESIGN.md](DESIGN.md) for the storage model, index and execution choices, feature-vector definitions, and tradeoffs. The vectors are lightweight image-color, audio-signal, and coarse video-descriptor features, not learned semantic embeddings: similarity is most useful for visually or acoustically similar media in the same modality. The LSH index is rebuilt in memory when the process starts; payload files and the JSON catalog persist across runs.
