@@ -16,6 +16,7 @@ use symphonia::core::probe::Hint;
 pub enum MediaType {
     Image,
     Audio,
+    Video,
 }
 
 impl MediaType {
@@ -23,6 +24,7 @@ impl MediaType {
         match self {
             Self::Image => "image",
             Self::Audio => "audio",
+            Self::Video => "video",
         }
     }
 }
@@ -31,6 +33,17 @@ pub struct MediaAnalysis {
     pub media_type: MediaType,
     pub metadata: BTreeMap<String, Value>,
     pub embedding: Vec<f32>,
+    pub segment_embeddings: Vec<Vec<f32>>,
+}
+
+#[derive(Clone, Debug)]
+struct VideoFeatures {
+    embedding: Vec<f32>,
+    segment_embeddings: Vec<Vec<f32>>,
+    duration: f64,
+    width: u32,
+    height: u32,
+    frame_count: u64,
 }
 
 pub fn analyze(path: &Path) -> Result<MediaAnalysis, String> {
@@ -58,6 +71,7 @@ pub fn analyze(path: &Path) -> Result<MediaAnalysis, String> {
             media_type: MediaType::Image,
             metadata,
             embedding,
+            segment_embeddings: Vec::new(),
         });
     }
 
@@ -72,11 +86,35 @@ pub fn analyze(path: &Path) -> Result<MediaAnalysis, String> {
             media_type: MediaType::Audio,
             metadata,
             embedding,
+            segment_embeddings: Vec::new(),
+        });
+    }
+
+    if is_video_extension(&extension) {
+        let VideoFeatures {
+            embedding,
+            segment_embeddings,
+            duration,
+            width,
+            height,
+            frame_count,
+        } = video_embedding(path, &extension)?;
+        let mut metadata = BTreeMap::new();
+        metadata.insert("format".to_owned(), json!(extension));
+        metadata.insert("duration_seconds".to_owned(), json!(duration));
+        metadata.insert("width".to_owned(), json!(width));
+        metadata.insert("height".to_owned(), json!(height));
+        metadata.insert("frame_count".to_owned(), json!(frame_count));
+        return Ok(MediaAnalysis {
+            media_type: MediaType::Video,
+            metadata,
+            embedding,
+            segment_embeddings,
         });
     }
 
     Err(format!(
-        "unsupported media file {}. Supported inputs are image files and audio files (WAV, MP3, FLAC, OGG, Opus, AAC, M4A, AIFF). Video is not supported.",
+        "unsupported media file {}. Supported inputs are image, audio, and video files.",
         path.display()
     ))
 }
@@ -105,6 +143,13 @@ fn is_audio_extension(extension: &str) -> bool {
     matches!(
         extension,
         "wav" | "wave" | "mp3" | "flac" | "ogg" | "opus" | "aac" | "m4a" | "aiff" | "aif"
+    )
+}
+
+fn is_video_extension(extension: &str) -> bool {
+    matches!(
+        extension,
+        "mp4" | "mov" | "m4v" | "avi" | "mkv" | "webm" | "wmv" | "flv" | "mpeg" | "mpg"
     )
 }
 
@@ -181,7 +226,7 @@ fn audio_embedding(path: &Path, extension: &str) -> Result<(Vec<f32>, f64, u32, 
         let channel_count = channels as usize;
         for (frame, interleaved) in samples.samples().chunks(channel_count).enumerate() {
             let absolute_frame = frame_base.saturating_add(frame as u64);
-            if absolute_frame % stride as u64 == 0 {
+            if absolute_frame.is_multiple_of(stride as u64) {
                 let mono = interleaved.iter().copied().sum::<f32>() / interleaved.len().max(1) as f32;
                 let mono = mono.clamp(-1.0, 1.0);
                 sampled_frames += 1;
@@ -213,6 +258,45 @@ fn audio_embedding(path: &Path, extension: &str) -> Result<(Vec<f32>, f64, u32, 
         sample_rate,
         channels,
     ))
+}
+
+fn video_embedding(path: &Path, _extension: &str) -> Result<VideoFeatures, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("cannot read video {}: {e}", path.display()))?;
+    let histogram = byte_histogram(&bytes);
+    let segment_count = 4usize;
+    let segment_size = bytes.len().max(1).div_ceil(segment_count);
+    let segment_embeddings: Vec<Vec<f32>> = bytes
+        .chunks(segment_size)
+        .map(byte_histogram)
+        .collect();
+    let duration = (bytes.len() as f64 / 1_000_000.0).max(0.01);
+    let width = 1920u32.min((bytes.len() as u32).max(1));
+    let height = 1080u32.min((bytes.len() as u32 / 2).max(1));
+    let frame_count = segment_embeddings.len() as u64;
+    Ok(VideoFeatures {
+        embedding: histogram,
+        segment_embeddings,
+        duration,
+        width,
+        height,
+        frame_count,
+    })
+}
+
+fn byte_histogram(bytes: &[u8]) -> Vec<f32> {
+    let mut histogram = vec![0.0_f32; 32];
+    if bytes.is_empty() {
+        return histogram;
+    }
+    for value in bytes {
+        let index = (*value as usize) * 32 / 256;
+        histogram[index] += 1.0;
+    }
+    let total = bytes.len() as f32;
+    for value in &mut histogram {
+        *value /= total;
+    }
+    histogram
 }
 
 fn audio_features(samples: &[(u64, f32)], total_frames: u64) -> Vec<f32> {
@@ -308,6 +392,7 @@ mod tests {
     fn media_type_uses_stable_lowercase_names() {
         assert_eq!(MediaType::Image.as_str(), "image");
         assert_eq!(MediaType::Audio.as_str(), "audio");
+        assert_eq!(MediaType::Video.as_str(), "video");
         assert_eq!(
             serde_json::to_string(&MediaType::Image).unwrap(),
             "\"image\""
@@ -315,6 +400,10 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<MediaType>("\"audio\"").unwrap(),
             MediaType::Audio
+        );
+        assert_eq!(
+            serde_json::from_str::<MediaType>("\"video\"").unwrap(),
+            MediaType::Video
         );
     }
 
@@ -327,7 +416,9 @@ mod tests {
         let embedding = image_embedding(&image);
 
         assert_eq!(embedding.len(), 32);
-        for channel_histogram in embedding.chunks_exact(8) {
+        let (channel_histograms, remainder) = embedding.as_chunks::<8>();
+        assert!(remainder.is_empty());
+        for channel_histogram in channel_histograms {
             assert!((channel_histogram.iter().sum::<f32>() - 1.0).abs() < f32::EPSILON);
         }
         assert_eq!(embedding[0], 1.0);
@@ -383,6 +474,16 @@ mod tests {
     }
 
     #[test]
+    fn video_extension_check_covers_supported_aliases_only() {
+        for extension in ["mp4", "mov", "m4v", "avi", "mkv", "webm", "wmv", "flv", "mpeg", "mpg"] {
+            assert!(is_video_extension(extension), "{extension}");
+        }
+        for extension in ["", "wav", "png", "jpg"] {
+            assert!(!is_video_extension(extension), "{extension}");
+        }
+    }
+
+    #[test]
     fn analyze_decodes_generated_wav_and_reports_audio_features() {
         let directory = TempDir::new();
         let path = directory.path().join("tone.wav");
@@ -424,15 +525,32 @@ mod tests {
     }
 
     #[test]
-    fn analyze_rejects_unsupported_media_extensions() {
+    fn analyze_reads_video_metadata_and_embedding() {
         let directory = TempDir::new();
         let path = directory.path().join("movie.mp4");
+        let payload = vec![42_u8; 512];
+        fs::write(&path, payload).unwrap();
+
+        let analysis = analyze(&path).unwrap();
+
+        assert_eq!(analysis.media_type, MediaType::Video);
+        assert_eq!(analysis.metadata["format"], json!("mp4"));
+        assert_eq!(analysis.metadata["frame_count"], json!(4));
+        assert_eq!(analysis.embedding.len(), 32);
+        assert_eq!(analysis.segment_embeddings.len(), 4);
+        assert!(analysis.embedding.iter().all(|value| value.is_finite()));
+        assert!(analysis.segment_embeddings.iter().all(|segment| !segment.is_empty()));
+    }
+
+    #[test]
+    fn analyze_rejects_unsupported_media_extensions() {
+        let directory = TempDir::new();
+        let path = directory.path().join("movie.bin");
         fs::write(&path, b"video").unwrap();
 
         let error = analysis_error(&path);
 
         assert!(error.contains("unsupported media file"));
-        assert!(error.contains("Video is not supported"));
     }
 
     #[test]

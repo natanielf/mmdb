@@ -3,7 +3,7 @@ use crate::index::{cosine_similarity, object_value, LshIndex, MetadataIndex};
 use crate::media::{self, MediaType};
 use serde_json::Value;
 use std::cmp::Ordering;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 #[derive(Clone, Debug)]
@@ -117,12 +117,13 @@ pub fn parse(input: &str) -> Result<Command, String> {
 
     let media = parser
         .next_word()
-        .ok_or_else(|| "FIND requires IMAGE, AUDIO, or OBJECT".to_owned())?;
+        .ok_or_else(|| "FIND requires IMAGE, AUDIO, VIDEO, or OBJECT".to_owned())?;
     let media_type = match media.to_ascii_uppercase().as_str() {
         "IMAGE" => Some(MediaType::Image),
         "AUDIO" => Some(MediaType::Audio),
+        "VIDEO" => Some(MediaType::Video),
         "OBJECT" => None,
-        _ => return Err(format!("unsupported media type '{media}'; use IMAGE, AUDIO, or OBJECT")),
+        _ => return Err(format!("unsupported media type '{media}'; use IMAGE, AUDIO, VIDEO, or OBJECT")),
     };
     let mut query = FindQuery {
         media_type,
@@ -379,11 +380,11 @@ fn choose_plan(requested: Plan, query: &FindQuery) -> Plan {
     }
 }
 
-fn resolve_query_path(path: &PathBuf, store: &Store) -> Result<PathBuf, String> {
+fn resolve_query_path(path: &Path, store: &Store) -> Result<PathBuf, String> {
     if path.is_file() {
-        return Ok(path.clone());
+        return Ok(path.to_path_buf());
     }
-    let in_database = store.resolve_location(&path.to_string_lossy());
+    let in_database = store.resolve_location(path.to_string_lossy().as_ref());
     if in_database.is_file() {
         return Ok(in_database);
     }
@@ -407,7 +408,7 @@ fn indexed_candidates(
     for predicate in predicates {
         if predicate.operator == Operator::Eq {
             if let Some(positions) = index.equality(&predicate.field, &predicate.value) {
-                if shortest.map_or(true, |current| positions.len() < current.len()) {
+                if shortest.is_none_or(|current| positions.len() < current.len()) {
                     shortest = Some(positions);
                 }
             }
@@ -703,6 +704,7 @@ mod tests {
                             ("label".to_owned(), json!("north ridge")),
                         ]),
                         embedding: red_embedding,
+                        segment_embeddings: vec![],
                     },
                     MediaObject {
                         object_id: 10,
@@ -716,6 +718,7 @@ mod tests {
                             ("label".to_owned(), json!("east ridge")),
                         ]),
                         embedding: blue_embedding,
+                        segment_embeddings: vec![],
                     },
                     MediaObject {
                         object_id: 30,
@@ -729,6 +732,7 @@ mod tests {
                             ("label".to_owned(), json!("south ridge")),
                         ]),
                         embedding: green_embedding,
+                        segment_embeddings: vec![],
                     },
                 ],
                 next_id: 31,
@@ -846,6 +850,11 @@ mod tests {
             panic!("expected FIND command");
         };
         assert_eq!(audio_query.media_type, Some(MediaType::Audio));
+
+        let Command::Find(video_query) = parse("FIND video").unwrap() else {
+            panic!("expected FIND command");
+        };
+        assert_eq!(video_query.media_type, Some(MediaType::Video));
     }
 
     #[test]
@@ -893,10 +902,11 @@ mod tests {
             assert_eq!(query.predicates[0].operator, expected, "{operator}");
         }
 
-        let Command::Find(query) = parse("FIND OBJECT LIMIT '7'").unwrap() else {
+        let Command::Find(video_query) = parse("FIND VIDEO LIMIT '7'").unwrap() else {
             panic!("expected FIND command");
         };
-        assert_eq!(query.limit, 7);
+        assert_eq!(video_query.media_type, Some(MediaType::Video));
+        assert_eq!(video_query.limit, 7);
     }
 
     #[test]
@@ -909,7 +919,7 @@ mod tests {
 
     #[test]
     fn parse_rejects_invalid_commands_and_media_types() {
-        for statement in ["", "SELECT IMAGE", "FIND", "FIND VIDEO"] {
+        for statement in ["", "SELECT IMAGE", "FIND"] {
             assert!(parse(statement).is_err(), "{statement}");
         }
     }
