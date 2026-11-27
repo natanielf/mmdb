@@ -6,14 +6,14 @@ A small Rust multimodal database engine for **image, audio, and video files**. I
 
 Install the Rust stable toolchain, then run commands from this directory:
 
-~~~text
+```text
 cargo build --release
 cargo run --release -- init
 cargo run --release -- ingest ./media/drone-01.jpg camera=drone timestamp='2026-02-18T10:30:00Z'
 cargo run --release -- ingest ./media/field-recording.wav speaker=unknown
 cargo run --release -- ingest ./media/clip.mp4 camera=drone duration_seconds=12.5
 cargo run --release -- stats
-~~~
+```
 
 The --db DIR option selects the database root. By default, MMDB uses the current directory. It stores its catalog at DIR/data/catalog.json and copies payloads to DIR/data/objects/.
 
@@ -38,7 +38,7 @@ Segment embeddings are stored as a list of per-segment feature vectors for riche
 
 Ingested fields are typed when the value is valid JSON; otherwise they are stored as strings. For example, camera=drone is a string and rating=4 is a number. The special timestamp attribute sets the catalog's RFC 3339 capture time.
 
-~~~text
+```text
 cargo run --release -- ingest ./media/drone-01.jpg camera=drone location=roof
 cargo run --release -- query "FIND IMAGE WHERE camera = 'drone' AND timestamp >= '2026-01-01' LIMIT 20"
 cargo run --release -- query "FIND AUDIO WHERE duration < 30 LIMIT 10"
@@ -48,18 +48,18 @@ cargo run --release -- query "FIND AUDIO SIMILAR TO './media/query.wav' LIMIT 10
 cargo run --release -- query "FIND VIDEO SIMILAR TO './media/query.mp4' LIMIT 10" --plan ann
 cargo run --release -- query "FIND IMAGE WHERE camera = 'drone' SIMILAR TO './media/query.jpg' LIMIT 10" --plan vector-first
 cargo run --release -- get 1
-~~~
+```
 
 The query parser accepts:
 
-~~~text
+```text
 FIND IMAGE|AUDIO|VIDEO|OBJECT
 [WHERE field (=|!=|<|<=|>|>=|CONTAINS|BETWEEN) value [AND ...]]
 [SIMILAR TO 'query-media-path']
 [LIMIT positive-integer]
 
 GET object-id
-~~~
+```
 
 `CONTAINS` matches substring values in string fields, and `BETWEEN low AND high` evaluates inclusive numeric or timestamp ranges.
 
@@ -67,23 +67,37 @@ OBJECT searches all supported media types. A similarity query must use a query f
 
 Use --plan to select indexed, scan, exact, ann, filter-first, or vector-first. auto uses an indexed query for metadata-only queries, ANN for similarity-only queries, and filter-first for hybrid queries. The interactive prompt supports the same FIND and GET statements:
 
-~~~text
+```text
 cargo run --release
 db> FIND IMAGE WHERE camera = 'drone' LIMIT 10
 db> FIND VIDEO WHERE duration_seconds < 60 LIMIT 5
 db> GET 1
 db> exit
-~~~
+```
 
 ## Evaluation
 
 Compare a group of queries with bench; quote each query as a separate argument. Point lookups use the object-ID hash index. Similarity workloads report exact, ANN, filter-first, and vector-first latency, candidates examined, and Recall@10 relative to exact search. Metadata workloads compare a full scan with the hash-indexed plan.
 
-~~~text
+```text
 cargo run --release -- bench "GET 1" "GET 2" "FIND IMAGE WHERE camera = 'drone' LIMIT 100" "FIND IMAGE SIMILAR TO './queries/image-1.jpg' LIMIT 10" "FIND VIDEO WHERE duration_seconds < 60 LIMIT 10" "FIND AUDIO WHERE speaker = 'unknown' SIMILAR TO './queries/audio-1.wav' LIMIT 10"
-~~~
+```
 
 stats reports the object, embedding, payload, catalog, and estimated in-memory index sizes, plus index build times.
+
+### Python benchmark workflow
+
+The scripts in `benchmark/` use the existing CLI and the repository's `data/` directory. `benchmark/download.py` downloads the configured Caltech-101, ESC-50, and UCF101-DS archives under `data/.downloads/` and safely extracts them into `data/<dataset_name>/`, including embedded ZIP/TAR archives one level deep.
+
+```sh
+uv venv .venv
+uv pip install --python .venv/bin/python -r benchmark/requirements.txt
+.venv/bin/python benchmark/download.py
+.venv/bin/python benchmark/ingest.py
+.venv/bin/python benchmark/benchmark.py --queries-per-modality 5 --seed 0
+```
+
+Ingestion recursively discovers image, audio, and video files supported by MMDB, adds dataset/category/source-path metadata, and stores the database separately under `benchmark/db/`. It skips source paths already recorded in that database, can be limited with `--max-files`, and reports per-file failures with a non-zero exit status. The benchmark samples multiple query files per modality and compares the existing scan/indexed and exact/ANN/filter-first/vector-first plans. CSV and JSON results, including p50/p95 latency, Recall@10, candidates examined, index build/size, storage, and approximate in-memory index size, are written under `benchmark/results/`. Matplotlib creates four report-ready 300-DPI PNG plots there: `latency`, `recall_at_10`, `candidates_examined`, and `index_and_storage`. Metadata and similarity workloads are plotted separately. MMDB currently provides one ANN configuration.
 
 ## Integration tests
 
